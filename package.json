@@ -1,7 +1,7 @@
 {
   "name": "claude-devtools",
   "type": "module",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Desktop app that visualizes Claude Code session execution — explore conversations, track context usage, and analyze tool calls",
   "license": "MIT",
   "author": {

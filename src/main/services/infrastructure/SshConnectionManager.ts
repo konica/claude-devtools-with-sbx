@@ -18,12 +18,13 @@
  */
 
 import { createLogger } from '@shared/utils/logger';
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
+import { Duplex } from 'stream';
 import { Client, type SFTPWrapper } from 'ssh2';
 
 import { LocalFileSystemProvider } from './LocalFileSystemProvider';
@@ -67,6 +68,7 @@ interface AuthAttempt {
 }
 
 type AuthCandidate =
+  | { kind: 'none'; label: string }
   | { kind: 'agent'; socket: string; label: string }
   | { kind: 'privateKey'; data: string; label: string }
   | { kind: 'password'; password: string; label: string };
@@ -77,6 +79,7 @@ interface ResolvedTarget {
   username: string;
   resolved: ResolvedSshHost | null;
   matchedAlias?: string;
+  proxyCommand?: string;
 }
 
 const CONNECT_TIMEOUT_MS = 25_000;
@@ -262,27 +265,39 @@ export class SshConnectionManager extends EventEmitter {
       // cause when terminal `ssh` works but this app doesn't is a per-app VPN
       // (Cisco AnyConnect, GlobalProtect, Cloudflare WARP, some MDM clients)
       // that routes whitelisted bundle IDs only.
-      timings.start(`tcp probe ${target.host}:${target.port}`);
-      const probe = await probeTcp(target.host, target.port, TCP_PROBE_TIMEOUT_MS);
-      timings.end(`tcp probe ${target.host}:${target.port}`);
-      attempts.push({
-        source: `TCP probe ${target.host}:${target.port}`,
-        outcome: probe.ok ? 'used' : 'failed',
-        reason: probe.reason,
-      });
+      //
+      // Skip the probe when ProxyCommand is configured: the final host isn't
+      // directly reachable (that's the whole point of the proxy), so a direct
+      // TCP probe would always fail even when connectivity is fine.
+      if (target.proxyCommand) {
+        attempts.push({
+          source: `TCP probe ${target.host}:${target.port}`,
+          outcome: 'skipped',
+          reason: 'ProxyCommand configured — connection routed via proxy',
+        });
+      } else {
+        timings.start(`tcp probe ${target.host}:${target.port}`);
+        const probe = await probeTcp(target.host, target.port, TCP_PROBE_TIMEOUT_MS);
+        timings.end(`tcp probe ${target.host}:${target.port}`);
+        attempts.push({
+          source: `TCP probe ${target.host}:${target.port}`,
+          outcome: probe.ok ? 'used' : 'failed',
+          reason: probe.reason,
+        });
 
-      if (!probe.ok) {
-        throw this.enrichAuthError(
-          new Error(
-            `Cannot reach ${target.host}:${target.port} from this app (${probe.reason ?? 'unknown'}).\n` +
-              `If \`ssh ${config.host}\` works in your terminal, the host is reachable from your ` +
-              'shell but not from this Electron process. The most common cause is a per-app VPN ' +
-              '(some corporate VPN clients route only whitelisted apps through the tunnel) — ' +
-              "add this app to your VPN client's allowed-apps list, or switch the VPN to full-tunnel mode."
-          ),
-          attempts,
-          timings
-        );
+        if (!probe.ok) {
+          throw this.enrichAuthError(
+            new Error(
+              `Cannot reach ${target.host}:${target.port} from this app (${probe.reason ?? 'unknown'}).\n` +
+                `If \`ssh ${config.host}\` works in your terminal, the host is reachable from your ` +
+                'shell but not from this Electron process. The most common cause is a per-app VPN ' +
+                '(some corporate VPN clients route only whitelisted apps through the tunnel) — ' +
+                "add this app to your VPN client's allowed-apps list, or switch the VPN to full-tunnel mode."
+            ),
+            attempts,
+            timings
+          );
+        }
       }
 
       // Single TCP/SSH session — ssh2's authHandler walks our candidate list,
@@ -296,23 +311,41 @@ export class SshConnectionManager extends EventEmitter {
       timings.start(`tcp+handshake ${target.host}:${target.port}`);
       try {
         await new Promise<void>((resolve, reject) => {
+          const cleanup = (): void => {
+            client.removeListener('ready', onReady);
+            client.removeListener('error', onError);
+            client.removeListener('end', onEarlyDisconnect);
+            client.removeListener('close', onEarlyDisconnect);
+          };
           const onReady = (): void => {
             if (lastTried) {
               attempts.push({ source: lastTried.label, outcome: 'used' });
             }
-            client.removeListener('error', onError);
+            cleanup();
             resolve();
           };
           const onError = (err: Error): void => {
-            client.removeListener('ready', onReady);
+            cleanup();
             reject(err);
+          };
+          // The server can disconnect WITHOUT emitting 'error' — e.g. a strict
+          // Go SSH server (or a ProxyCommand that exits cleanly) drops the
+          // connection mid-auth. ssh2 then emits only 'end'/'close' and clears
+          // its own readyTimeout, so without these listeners the promise would
+          // hang until the outer 25s timer. Whichever fires first rejects.
+          const onEarlyDisconnect = (): void => {
+            cleanup();
+            reject(new Error('SSH connection closed before authentication completed'));
           };
           client.once('ready', onReady);
           client.once('error', onError);
+          client.once('end', onEarlyDisconnect);
+          client.once('close', onEarlyDisconnect);
 
           client.connect({
-            host: target.host,
-            port: target.port,
+            ...(target.proxyCommand
+              ? { sock: spawnProxyCommand(target.proxyCommand) }
+              : { host: target.host, port: target.port }),
             username: target.username,
             readyTimeout: SSH2_READY_TIMEOUT_MS,
             tryKeyboard: false,
@@ -333,6 +366,9 @@ export class SshConnectionManager extends EventEmitter {
               }
               lastTried = next;
               switch (next.kind) {
+                case 'none':
+                  callback({ type: 'none', username: target.username });
+                  return;
                 case 'agent':
                   callback({ type: 'agent', username: target.username, agent: next.socket });
                   return;
@@ -430,12 +466,33 @@ export class SshConnectionManager extends EventEmitter {
       }
     }
 
+    const effectiveHost = resolved?.hostname ?? config.host;
+    const effectivePort = resolved?.port ?? config.port;
+    const effectiveUser = config.username || resolved?.user || os.userInfo().username;
+    const rawProxy = resolved?.proxyCommand;
+    // Expand all standard ssh_config ProxyCommand tokens in a single pass so
+    // that %%x sequences produce a literal %x rather than an expanded value.
+    const proxyCommand = rawProxy
+      ? rawProxy.replace(/%%|%[hnpru]/g, (token) => {
+          switch (token) {
+            case '%%': return '%';
+            case '%h': return effectiveHost;
+            case '%n': return config.host; // original hostname before HostName substitution
+            case '%p': return String(effectivePort);
+            case '%r': return effectiveUser;
+            case '%u': return os.userInfo().username;
+            default: return token;
+          }
+        })
+      : undefined;
+
     return {
-      host: resolved?.hostname ?? config.host,
-      port: resolved?.port ?? config.port,
+      host: effectiveHost,
+      port: effectivePort,
       username: config.username || resolved?.user || os.userInfo().username,
       resolved,
       matchedAlias,
+      proxyCommand,
     };
   }
 
@@ -500,6 +557,16 @@ export class SshConnectionManager extends EventEmitter {
 
     const candidates: AuthCandidate[] = [];
     const usedKeyPaths = new Set<string>();
+
+    // "none" auth, tried first — exactly what OpenSSH does. Some servers (e.g.
+    // sandbox/jump-host proxies where the ProxyCommand already authenticated,
+    // like Docker Sandbox's `sbx.exe ssh proxy`) accept `none` and require no
+    // key at all. Without this probe we'd offer a publickey the server never
+    // asked for; strict Go-based servers respond by dropping the connection
+    // (which manifested as a 25s hang). If the server rejects `none`, ssh2's
+    // authHandler simply advances to the agent/key candidates below — the same
+    // fall-through OpenSSH performs after its initial `none` probe.
+    candidates.push({ kind: 'none', label: 'none (server may not require auth)' });
 
     // Agents — every accessible agent gets its own candidate. Many users have
     // both a system ssh-agent AND a 1Password agent, with the right key on
@@ -622,6 +689,16 @@ export class SshConnectionManager extends EventEmitter {
           `systemd agent /run/user/${uid}/ssh-agent.socket`
         );
         await tryAdd(`/run/user/${uid}/keyring/ssh`, `gnome-keyring /run/user/${uid}/keyring/ssh`);
+      }
+    }
+
+    // Windows OpenSSH Authentication Agent uses a named pipe. fs.access() does
+    // not work for named pipes, so we probe by attempting a real connection.
+    if (process.platform === 'win32') {
+      const winPipe = '\\\\.\\pipe\\openssh-ssh-agent';
+      if (!seen.has(winPipe) && (await probeWindowsNamedPipe(winPipe))) {
+        seen.add(winPipe);
+        out.push({ kind: 'agent', socket: winPipe, label: 'Windows OpenSSH agent' });
       }
     }
 
@@ -797,6 +874,86 @@ function getLaunchctlSshAuthSock(): Promise<string | null> {
         return;
       }
       resolve(stdout.trim());
+    });
+  });
+}
+
+/**
+ * Spawns a ProxyCommand subprocess and wraps its stdin/stdout in a Duplex
+ * stream suitable for ssh2's `sock` option. The ProxyCommand string must
+ * already have %h/%p tokens expanded before this is called.
+ *
+ * We use `shell: true` because ProxyCommands routinely contain shell syntax
+ * (pipes, quoting, compound commands). The command comes from the user's own
+ * ~/.ssh/config, so shell execution is expected and safe here.
+ */
+function spawnProxyCommand(command: string): Duplex {
+  const child = spawn(command, [], { shell: true, stdio: 'pipe', windowsHide: true });
+  const stderrLines: string[] = [];
+
+  const duplex = new Duplex({
+    read() {},
+    write(chunk, enc, cb) {
+      if (!child.stdin.destroyed) {
+        child.stdin.write(chunk, enc, cb);
+      } else {
+        cb(new Error('ProxyCommand stdin closed unexpectedly'));
+      }
+    },
+    destroy(err, cb) {
+      try {
+        child.kill();
+      } catch {
+        /* ignore */
+      }
+      cb(err);
+    },
+  });
+
+  child.stdout.on('data', (d: Buffer) => duplex.push(d));
+  child.on('error', (e: Error) => duplex.destroy(e));
+  child.stderr.on('data', (d: Buffer) => {
+    const line = d.toString().trimEnd();
+    stderrLines.push(line);
+    logger.debug(`ProxyCommand stderr: ${line}`);
+  });
+
+  // Wait for the subprocess to fully close before signaling stream end so we
+  // can surface the exit code + stderr in the error — otherwise ssh2 sees EOF
+  // and emits the opaque "Connection lost before handshake" with no clue why.
+  child.on('close', (code) => {
+    if (duplex.destroyed) return;
+    if (code !== 0 && code !== null) {
+      const detail = stderrLines.length > 0 ? `\n${stderrLines.join('\n')}` : '';
+      duplex.destroy(new Error(`ProxyCommand exited with code ${code}${detail}`));
+    } else {
+      duplex.push(null);
+    }
+  });
+
+  return duplex;
+}
+
+/**
+ * Probes a Windows named pipe by attempting a real connection — fs.access()
+ * does not work for named pipes so a filesystem check would always say "not
+ * found" even when the agent service is running.
+ */
+function probeWindowsNamedPipe(pipePath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = net.createConnection({ path: pipePath });
+    const timer = setTimeout(() => {
+      sock.destroy();
+      resolve(false);
+    }, 500);
+    sock.once('connect', () => {
+      clearTimeout(timer);
+      sock.destroy();
+      resolve(true);
+    });
+    sock.once('error', () => {
+      clearTimeout(timer);
+      resolve(false);
     });
   });
 }

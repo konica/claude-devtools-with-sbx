@@ -48,3 +48,4 @@ claude-dev.tools/*
 
 eslint-fix/
 remotion/*
+.sandbox

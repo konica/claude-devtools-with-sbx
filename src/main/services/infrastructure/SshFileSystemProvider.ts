@@ -31,6 +31,23 @@ export class SshFileSystemProvider implements FileSystemProvider {
     this.sftp = sftp;
   }
 
+  /**
+   * Coerces a path to POSIX form for the remote SFTP server.
+   *
+   * Callers build paths with Node's `path` module, which is `path.win32` on
+   * Windows hosts and emits backslash separators (e.g.
+   * `\home\agent\.claude\projects\foo`). A POSIX SFTP server does not treat a
+   * backslash-leading path as absolute, so it resolves it relative to the SFTP
+   * home — producing mangled, doubled paths like
+   * `/home/agent/\home\agent\.claude\projects\foo` that never resolve. The
+   * remote filesystem is always POSIX, so converting `\` → `/` here (the one
+   * boundary that actually talks to the server) corrects every call site at
+   * once. On POSIX hosts the input already uses `/`, so this is a no-op.
+   */
+  private toRemotePath(filePath: string): string {
+    return filePath.replace(/\\/g, '/');
+  }
+
   async exists(filePath: string): Promise<boolean> {
     try {
       await this.stat(filePath);
@@ -55,11 +72,12 @@ export class SshFileSystemProvider implements FileSystemProvider {
   }
 
   async readFile(filePath: string, encoding: BufferEncoding = 'utf8'): Promise<string> {
+    const remotePath = this.toRemotePath(filePath);
     let lastError: unknown;
     for (let attempt = 1; attempt <= SshFileSystemProvider.MAX_RETRIES; attempt++) {
       try {
         return await new Promise<string>((resolve, reject) => {
-          this.sftp.readFile(filePath, { encoding }, (err, data) => {
+          this.sftp.readFile(remotePath, { encoding }, (err, data) => {
             if (err) {
               reject(err);
               return;
@@ -84,11 +102,12 @@ export class SshFileSystemProvider implements FileSystemProvider {
   }
 
   async stat(filePath: string): Promise<FsStatResult> {
+    const remotePath = this.toRemotePath(filePath);
     let lastError: unknown;
     for (let attempt = 1; attempt <= SshFileSystemProvider.MAX_RETRIES; attempt++) {
       try {
         return await new Promise<FsStatResult>((resolve, reject) => {
-          this.sftp.stat(filePath, (err, stats) => {
+          this.sftp.stat(remotePath, (err, stats) => {
             if (err) {
               reject(err);
               return;
@@ -126,11 +145,12 @@ export class SshFileSystemProvider implements FileSystemProvider {
   }
 
   async readdir(dirPath: string): Promise<FsDirent[]> {
+    const remotePath = this.toRemotePath(dirPath);
     let lastError: unknown;
     for (let attempt = 1; attempt <= SshFileSystemProvider.MAX_RETRIES; attempt++) {
       try {
         return await new Promise<FsDirent[]>((resolve, reject) => {
-          this.sftp.readdir(dirPath, (err, list) => {
+          this.sftp.readdir(remotePath, (err, list) => {
             if (err) {
               reject(err);
               return;
@@ -177,7 +197,7 @@ export class SshFileSystemProvider implements FileSystemProvider {
 
   createReadStream(filePath: string, opts?: ReadStreamOptions): Readable {
     try {
-      const sftpStream = this.sftp.createReadStream(filePath, {
+      const sftpStream = this.sftp.createReadStream(this.toRemotePath(filePath), {
         start: opts?.start,
         encoding: opts?.encoding ?? undefined,
       });

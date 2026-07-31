@@ -21,6 +21,7 @@ export interface ResolvedSshHost {
   user?: string;
   identityFiles: string[];
   identityAgent?: string;
+  proxyCommand?: string;
 }
 
 const SSH_G_TIMEOUT_MS = 5000;
@@ -98,6 +99,19 @@ export class SshHostResolver {
         case 'identityagent':
           if (value.toLowerCase() !== 'none') {
             result.identityAgent = expandTilde(value);
+          }
+          break;
+        case 'proxycommand':
+          // "none" disables proxying
+          if (value.toLowerCase() !== 'none') {
+            result.proxyCommand = value;
+          }
+          break;
+        case 'proxyjump':
+          // ProxyJump is syntactic sugar for `ssh -W %h:%p <jump>`. Only set if
+          // proxycommand hasn't already been parsed (proxycommand takes priority).
+          if (!result.proxyCommand && value.toLowerCase() !== 'none') {
+            result.proxyCommand = `ssh -W %h:%p ${value}`;
           }
           break;
       }
