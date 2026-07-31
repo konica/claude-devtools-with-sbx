@@ -178,6 +178,8 @@
     "publish": [
       {
         "provider": "github",
+        "owner": "konica",
+        "repo": "claude-devtools-with-sbx",
         "releaseType": "draft"
       }
     ]
